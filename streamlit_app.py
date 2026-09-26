@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from io import StringIO
+from itertools import zip_longest
 
 try:
     from kiteconnect import KiteConnect
@@ -17,11 +18,14 @@ st.markdown("Compare 3-year returns of **Compliant** vs **Non-Compliant** firms 
 
 DEFAULT_EXCHANGE = "NSE"
 YEARS_LOOKBACK = 3
+BENCHMARK_SYMBOL = "NIFTY 50"
+TRADING_DAYS_PER_YEAR = 252
 
 # --- Session State ---
 if "kite_access_token" not in st.session_state: st.session_state["kite_access_token"] = None
 if "analysis_done" not in st.session_state: st.session_state["analysis_done"] = False
 if "output_csv" not in st.session_state: st.session_state["output_csv"] = None
+if "enforcement_csv" not in st.session_state: st.session_state["enforcement_csv"] = None
 
 
 # --- Load Credentials from Streamlit Secrets ---
@@ -84,6 +88,10 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
         return pd.DataFrame({"_error": ["Kite not authenticated."]})
     instruments_df = load_instruments_cached(api_key, access_token, exchange)
     token = find_instrument_token(instruments_df, symbol, exchange)
+    if not token and symbol.upper() in ["NIFTY 50", "NIFTY50", "NIFTY BANK", "BANKNIFTY"]:
+        # Indices sit on NSE regardless of the exchange passed in
+        instruments_df = load_instruments_cached(api_key, access_token, "NSE")
+        token = find_instrument_token(instruments_df, symbol, "NSE")
     if not token:
         return pd.DataFrame({"_error": [f"Instrument token not found for {symbol}."]})
     try:
@@ -105,27 +113,57 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
         return pd.DataFrame({"_error": [str(e)]})
 
 
-def extract_symbols(df: pd.DataFrame) -> list[str]:
-    """Normalize column names and pull out the Symbol column."""
+def extract_firm_info(df: pd.DataFrame) -> list[dict]:
+    """Normalize column names and pull out Symbol / Company per firm."""
     df = df.copy()
     df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
     symbol_col = next((c for c in ["symbol", "tradingsymbol", "ticker"] if c in df.columns), None)
     if symbol_col is None:
         return []
-    return df[symbol_col].dropna().astype(str).str.strip().str.upper().unique().tolist()
+    name_col = next((c for c in ["company", "company_name", "name", "firm", "firm_name"] if c in df.columns), None)
+
+    df[symbol_col] = df[symbol_col].astype(str).str.strip().str.upper()
+    df = df.dropna(subset=[symbol_col]).drop_duplicates(subset=[symbol_col])
+
+    firms = []
+    for _, row in df.iterrows():
+        firms.append({
+            "Symbol": row[symbol_col],
+            "Company": str(row[name_col]).strip() if name_col and pd.notna(row.get(name_col)) else row[symbol_col],
+        })
+    return firms
 
 
-def compute_return_metrics(hist_df: pd.DataFrame) -> dict | None:
+def compute_security_metrics(hist_df: pd.DataFrame, benchmark_returns: pd.DataFrame | None) -> dict | None:
+    """Total/annualized return, annualized volatility, and beta vs the benchmark."""
     if hist_df.empty or "_error" in hist_df.columns or "close" not in hist_df.columns or len(hist_df) < 2:
         return None
-    start_row, end_row = hist_df.iloc[0], hist_df.iloc[-1]
+    hist = hist_df.copy()
+    hist["daily_return"] = hist["close"].pct_change()
+
+    start_row, end_row = hist.iloc[0], hist.iloc[-1]
     start_price, end_price = start_row["close"], end_row["close"]
     if pd.isna(start_price) or pd.isna(end_price) or start_price == 0:
         return None
+
     total_return = ((end_price - start_price) / start_price) * 100
     days_held = (end_row["date"] - start_row["date"]).days
     years_held = days_held / 365.25 if days_held > 0 else np.nan
     annualized_return = (((end_price / start_price) ** (1 / years_held)) - 1) * 100 if years_held and years_held > 0 else np.nan
+
+    daily_returns = hist["daily_return"].dropna()
+    volatility = daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100 if len(daily_returns) > 1 else np.nan
+
+    beta = np.nan
+    if benchmark_returns is not None and not benchmark_returns.empty:
+        merged = pd.merge(
+            hist[["date", "daily_return"]], benchmark_returns, on="date", how="inner"
+        ).dropna()
+        if len(merged) > 2:
+            covariance = merged["daily_return"].cov(merged["bm_return"])
+            bm_variance = merged["bm_return"].var()
+            beta = covariance / bm_variance if bm_variance > 0 else np.nan
+
     return {
         "Start Date": start_row["date"].date(),
         "Start Price": round(start_price, 2),
@@ -133,6 +171,8 @@ def compute_return_metrics(hist_df: pd.DataFrame) -> dict | None:
         "End Price": round(end_price, 2),
         "Total Return (%)": round(total_return, 2),
         "Annualized Return (%)": round(annualized_return, 2) if not pd.isna(annualized_return) else None,
+        "Beta": round(beta, 3) if not pd.isna(beta) else None,
+        "Volatility (Annualized %)": round(volatility, 2) if not pd.isna(volatility) else None,
         "Data Points": len(hist_df),
     }
 
@@ -174,7 +214,10 @@ with col1:
 with col2:
     noncompliant_file = st.file_uploader("Non-Compliant Firms CSV", type="csv", key="noncompliant_upload")
 
-st.caption("Each CSV needs at least a `Symbol` column with NSE trading symbols.")
+st.caption(
+    "Each CSV needs at least a `Symbol` column with NSE trading symbols. "
+    "An optional `Company` column will populate company names in the Enforcement Index."
+)
 
 if not k:
     st.info("Please login to Kite Connect above before running the analysis.")
@@ -182,35 +225,47 @@ if not k:
 run_disabled = not (k and compliant_file and noncompliant_file)
 
 if st.button("🚀 Fetch 3-Year Data & Compare Returns", type="primary", disabled=run_disabled, use_container_width=True):
-    compliant_symbols = extract_symbols(pd.read_csv(compliant_file))
-    noncompliant_symbols = extract_symbols(pd.read_csv(noncompliant_file))
+    compliant_firms = extract_firm_info(pd.read_csv(compliant_file))
+    noncompliant_firms = extract_firm_info(pd.read_csv(noncompliant_file))
 
-    if not compliant_symbols:
+    if not compliant_firms:
         st.error("No 'Symbol' column found in the Compliant Firms file.")
         st.stop()
-    if not noncompliant_symbols:
+    if not noncompliant_firms:
         st.error("No 'Symbol' column found in the Non-Compliant Firms file.")
         st.stop()
 
     to_date = datetime.now().date()
     from_date = to_date - timedelta(days=365 * YEARS_LOOKBACK)
 
+    # Benchmark data, used to compute beta for every security
+    benchmark_hist = get_historical_data_cached(api_key, access_token, BENCHMARK_SYMBOL, from_date, to_date, "NSE")
+    benchmark_returns = None
+    if not benchmark_hist.empty and "_error" not in benchmark_hist.columns:
+        benchmark_returns = benchmark_hist[["date"]].copy()
+        benchmark_returns["bm_return"] = benchmark_hist["close"].pct_change()
+    else:
+        st.warning(f"Could not fetch benchmark data for {BENCHMARK_SYMBOL} — Beta will be left blank.")
+
     all_rows, consolidated_rows, failed_symbols = [], [], []
-    groups = [("Compliant", compliant_symbols), ("Non-Compliant", noncompliant_symbols)]
-    total_symbols = len(compliant_symbols) + len(noncompliant_symbols)
+    per_group_records = {"Compliant": [], "Non-Compliant": []}
+    groups = [("Compliant", compliant_firms), ("Non-Compliant", noncompliant_firms)]
+    total_symbols = len(compliant_firms) + len(noncompliant_firms)
     progress = st.progress(0, text="Fetching historical data...")
     processed = 0
 
-    for group_name, symbols in groups:
-        for symbol in symbols:
+    for group_name, firms in groups:
+        for firm in firms:
+            symbol = firm["Symbol"]
             hist_df = get_historical_data_cached(api_key, access_token, symbol, from_date, to_date, DEFAULT_EXCHANGE)
-            metrics = compute_return_metrics(hist_df)
+            metrics = compute_security_metrics(hist_df, benchmark_returns)
             if metrics is None:
                 failed_symbols.append(f"{symbol} ({group_name})")
             else:
-                row = {"Symbol": symbol, "Group": group_name}
-                row.update(metrics)
-                all_rows.append(row)
+                record = {"Symbol": symbol, "Company": firm["Company"], "Group": group_name}
+                record.update(metrics)
+                all_rows.append(record)
+                per_group_records[group_name].append(record)
                 for _, r in hist_df.iterrows():
                     consolidated_rows.append({
                         "Date": r["date"].date(), "Symbol": symbol, "Group": group_name,
@@ -236,6 +291,7 @@ if st.button("🚀 Fetch 3-Year Data & Compare Returns", type="primary", disable
     noncompliant_returns = returns_df.loc[returns_df["Group"] == "Non-Compliant", "Total Return (%)"]
 
     def safe(fn, series):
+        series = series.dropna()
         return round(fn(series), 2) if not series.empty else None
 
     summary_rows = [
@@ -269,8 +325,38 @@ if st.button("🚀 Fetch 3-Year Data & Compare Returns", type="primary", disable
     summary_df.to_csv(buf, index=False)
     buf.write("\n\nCONSOLIDATED HISTORICAL DATA (DAILY)\n")
     consolidated_df.to_csv(buf, index=False)
-
     st.session_state["output_csv"] = buf.getvalue()
+
+    # --- Build the Enforcement Index: one row per compliant/non-compliant pair, matched by upload order ---
+    beta_compliant_avg = safe(pd.Series.mean, pd.Series([r["Beta"] for r in per_group_records["Compliant"] if r["Beta"] is not None]))
+    beta_noncompliant_avg = safe(pd.Series.mean, pd.Series([r["Beta"] for r in per_group_records["Non-Compliant"] if r["Beta"] is not None]))
+    vol_compliant_avg = safe(pd.Series.mean, pd.Series([r["Volatility (Annualized %)"] for r in per_group_records["Compliant"] if r["Volatility (Annualized %)"] is not None]))
+    vol_noncompliant_avg = safe(pd.Series.mean, pd.Series([r["Volatility (Annualized %)"] for r in per_group_records["Non-Compliant"] if r["Volatility (Annualized %)"] is not None]))
+
+    enforcement_rows = []
+    for c, nc in zip_longest(per_group_records["Compliant"], per_group_records["Non-Compliant"]):
+        c_return = c["Total Return (%)"] if c else None
+        nc_return = nc["Total Return (%)"] if nc else None
+        return_gap_pct_pts = round(c_return - nc_return, 2) if c_return is not None and nc_return is not None else None
+
+        enforcement_rows.append({
+            "Compliant Company": c["Company"] if c else None,
+            "compliant_ticker": c["Symbol"] if c else None,
+            "return_3years_compliant": c_return,
+            "Non-Compliant Company": nc["Company"] if nc else None,
+            "non_compliant_ticker": nc["Symbol"] if nc else None,
+            "return_3years_non_compliant": nc_return,
+            "return_gap_pct_pts": return_gap_pct_pts,
+            "beta_compliant_firms": beta_compliant_avg,
+            "beta_non_compliant_firms": beta_noncompliant_avg,
+            "standard_deviation_compliant": vol_compliant_avg,
+            "standard_deviation_non_compliant": vol_noncompliant_avg,
+        })
+
+    enforcement_df = pd.DataFrame(enforcement_rows)
+    st.session_state["enforcement_df"] = enforcement_df
+    st.session_state["enforcement_csv"] = enforcement_df.to_csv(index=False)
+
     st.success("✅ Analysis complete!")
 
 # --- Display Results ---
@@ -285,14 +371,28 @@ if st.session_state.get("analysis_done"):
     st.subheader("4. Consolidated Historical Data")
     st.dataframe(st.session_state["consolidated_df"], use_container_width=True, height=400)
 
+    st.subheader("5. Enforcement Index")
+    st.caption("Compliant firms paired with non-compliant firms in upload order.")
+    st.dataframe(st.session_state["enforcement_df"], use_container_width=True)
+
     st.markdown("---")
-    st.download_button(
-        "📥 Download Combined CSV Report",
-        st.session_state["output_csv"],
-        f"compliant_vs_noncompliant_returns_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        "text/csv",
-        use_container_width=True,
-    )
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            "📥 Download Combined CSV Report",
+            st.session_state["output_csv"],
+            f"compliant_vs_noncompliant_returns_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "text/csv",
+            use_container_width=True,
+        )
+    with dl_col2:
+        st.download_button(
+            "📥 Download Enforcement Index CSV",
+            st.session_state["enforcement_csv"],
+            f"enforcement_index_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "text/csv",
+            use_container_width=True,
+        )
 
 # --- Footer ---
 st.markdown("---")
